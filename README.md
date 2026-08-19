@@ -130,11 +130,43 @@ stateDiagram-v2
 
 ![First vs subsequent workspace provision latency](docs/benchmark-acl.png)
 
-On a real 4,332-file workspace the first provision used to block the event
-loop for ~2.8 s; with this package the synchronous cost on the server is
-negligible (the tree walk runs in the grant-cli child) and every later
-provision is ~1 ms (exact-ACE skip). On a ~182k-file monorepo the synchronous
-walk scales into minutes.
+![Scaling curve and event-loop responsiveness](docs/benchmark-acl-deep.png)
+
+Measured on synthetic trees (1k–30k files, rounds=7, first-add measured on 3
+independent dirs per scale; `scripts/bench-acl-deep.ts`, raw report
+`docs/bench-acl-deep.json`). To cross-validate on a real monorepo (e.g. the
+deepseek-harness checkout itself), run
+`pnpm exec node --import tsx/esm scripts/bench-acl-deep.ts --real <path> --report docs/bench-acl-deep-real.json`
+— note it writes a standing write ACE (never revoked) to that directory.
+
+| Files | Sync first median (server freeze) | First min/max | Subsequent median (skip) | Async stall max / p50 | Confirm cold (fail-closed window) | Confirm prewarmed |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1,000 | 202.2ms | 196.1/245.3 | 0.8ms | 86.5/15.7ms | 597.7ms | 342.1ms |
+| 5,000 | 1,173.2ms | 974.7/1,237.0 | 1.0ms | 79.1/15.5ms | 1,641.1ms | 325.3ms |
+| 10,000 | 1,931.8ms | 1,862.4/2,470.9 | 0.7ms | 70.9/15.5ms | 3,027.8ms | 358.8ms |
+| 20,000 | 5,015.3ms | 4,511.1/5,314.1 | 0.8ms | 74.8/15.6ms | 6,223.8ms | 356.7ms |
+| 30,000 | 7,574.6ms | 7,241.8/8,072.1 | 0.6ms | 117.6/15.6ms | 8,919.4ms | 345.1ms |
+
+- The sync first provision follows a **power law t = 0.133·n^1.06 (R² = 0.995)**
+  — statistically ~O(file count) — and is a whole-server freeze: a 5ms
+  `setInterval` fires ZERO times for the duration.
+- Every later provision is flat at **0.6–1.0ms median** (exact-ACE skip),
+  tree-size independent — the gap a user feels grows from ~250x at 1k files to
+  ~12,600x at 30k. Honest caveat: the skip is not strict O(1) — roughly 1 in
+  10–20 later provisions falls back to the full-tree merge path (the
+  `hasExactGrant` implausible-ACL guard) and takes ~the first-add wall clock
+  again. On the official sync path that tail is a server freeze on the event
+  loop; with this package it happens inside the `grant-cli` child, so the
+  server's responsiveness is unaffected either way.
+- With this package the same first-tree walk runs in the `grant-cli` child; the
+  server's largest event-loop gap is ~70–120ms (child-spawn cold start, p50
+  flat at ~15ms) and does **not** grow with tree size.
+- **Fail-closed confirm window**: while the grant is `preparing`, `confine()`
+  refuses the command (`SandboxUnavailableError`). That refusal lasts
+  `confirm cold` — child spawn + full-tree propagation (0.6s at 1k → 8.9s at
+  30k), all off the event loop. A `prewarm`ed workspace (standing ACE already
+  landed) cuts it to `confirm prewarmed`, a flat ~325–360ms of Node/tsx cold
+  start with the tree walk skipped — tree-size independent.
 
 ## Test
 
