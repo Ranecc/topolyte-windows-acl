@@ -141,7 +141,7 @@ async function main(): Promise<number> {
 
     // --- 4. workspace-write：confine 出 runner argv，temp ACE 落地 -------------
     const policy: SandboxPolicy = { mode: 'workspace-write', workspaceRoot: workspace, sessionId: SessionId('e2e-run') }
-    const confined = sandbox.confine(['node', '-e', probeScript(workspace, outside, '')], policy)
+    const confined = sandbox.confine(['node', '-e', ''], policy)
     const tempIndex = confined.argv.indexOf('--temp')
     const tempDir = tempIndex >= 0 ? confined.argv[tempIndex + 1] as string : ''
     scratch.push(tempDir)
@@ -151,6 +151,11 @@ async function main(): Promise<number> {
       `icacls 含 temp SID ${tempSid}: ${tempDacl.includes(tempSid)}\n      temp=${tempDir}`)
 
     // --- 5. 受限子进程写语义（runner WRITE_RESTRICTED 令牌）-----------------
+    // 探针需要真实 temp 路径：runner 的 --temp 在 '--' 分隔符之前（runner 自身参数），
+    // 被包命令（node -e）在 '--' 之后看不到它 → 拿到 tempDir 后把真实脚本注入 argv。
+    const sepIndex = confined.argv.indexOf('--')
+    const probeArgIndex = confined.argv.indexOf('-e', sepIndex) + 1
+    confined.argv[probeArgIndex] = probeScript(workspace, outside, tempDir)
     // TRAE agent 沙箱拦截受限令牌 CreateProcess（exit 2147483653）→ 标记 blocked。
     const result = await run(confined.argv)
     if (result.code === SANDBOX_BLOCKED_EXIT) {
