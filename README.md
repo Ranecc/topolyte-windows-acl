@@ -61,7 +61,7 @@ From a GitHub release tarball (no registry needed — download the `.tgz`
 attached to the release):
 
 ```sh
-dsh plugin --profile <name> add topolyte-windows-acl-0.1.0.tgz
+dsh plugin --profile <name> add topolyte-windows-acl-0.2.0.tgz
 ```
 
 From a local checkout:

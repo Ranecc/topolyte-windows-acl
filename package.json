@@ -1,7 +1,7 @@
 {
   "name": "@topolyte/windows-acl",
   "description": "Windows ACL write-restriction sandbox provider for DeepSeek Harness with NON-BLOCKING workspace grant materialization: the eager inheritable-ACE walk runs in a grant-helper child process (fire-and-forget), so a large workspace's first provision never freezes a command spawn. Installs on the OFFICIAL harness as a ctx.sandbox replacement — no fork required.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publishConfig": {
     "access": "public"
   },

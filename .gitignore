@@ -1,7 +1,7 @@
 node_modules/
 lib/
 *.tsbuildinfo
-scripts/e2e-acl-report.txt
+**/e2e-acl-report.txt
 # Archived pre-refactor source; kept locally for reference, never released.
 backup/
 # Packed release tarballs are attached to GitHub releases, not committed.
