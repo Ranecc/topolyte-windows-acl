@@ -29,6 +29,16 @@ Cordis bundle-patch mechanism — **no fork required**.
   provider dispose.
 - **`prewarm` config** — start the walk at boot for known workspaces, shrinking
   the fail-closed window before the first command.
+- **Bounded retry** — a per-workspace consecutive-failure counter
+  (`maxGrantRetries`, default 3): past the cap the workspace is pinned to
+  `failed` and automatic retries stop (fail-closed, never a freeze); an
+  operator or agent resets it with `retryWorkspaceGrant`.
+- **Explicit grant state** — `workspaceGrantState(root)` reports
+  `preparing` / `ready` / `failed`, so agents/executors can distinguish states
+  instead of guessing.
+- **Settle-aware shutdown** — provider dispose waits for every in-flight
+  grant-cli helper to settle before revoking temp ACEs, so a helper still
+  walking the tree is never orphaned or revoked mid-flight.
 - Built on the official `@deepseek-ai/dsh-sandbox-windows-acl` primitives
   (`AclWriteGrant`, `workspaceWriteSid`, `tempWriteSid`) and the official
   `SandboxProvider` base class — the full official sandbox semantics are
@@ -36,8 +46,23 @@ Cordis bundle-patch mechanism — **no fork required**.
 
 ## Install
 
+From the npm registry (after `npm publish` — the same one-liner as any plugin):
+
 ```sh
 dsh plugin --profile <name> add @topolyte/windows-acl
+```
+
+From a GitHub release tarball (no registry needed — download the `.tgz`
+attached to the release):
+
+```sh
+dsh plugin --profile <name> add topolyte-windows-acl-0.1.0.tgz
+```
+
+From a local checkout:
+
+```sh
+dsh plugin --profile <name> add /path/to/@topolyte/windows-acl
 ```
 
 The bundle's `cordis.patch.yml` disables the official `@deepseek-ai/dsh-sandbox-local`
@@ -66,6 +91,16 @@ tool-pwsh / tool-bash
 
 The expensive `grantWrite → SetNamedSecurityInfoW` eager inheritance walk runs
 in the `grant-cli` child process, so the harness event loop never blocks.
+
+## Measured impact
+
+![First vs subsequent workspace provision latency](docs/benchmark-acl.png)
+
+On a real 4,332-file workspace the first provision used to block the event
+loop for ~2.8 s; with this package the synchronous cost on the server is
+negligible (the tree walk runs in the grant-cli child) and every later
+provision is ~1 ms (exact-ACE skip). On a ~182k-file monorepo the synchronous
+walk scales into minutes.
 
 ## Test
 
