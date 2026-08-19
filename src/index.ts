@@ -53,6 +53,15 @@ export interface Config {
    * first confined command lands.
    */
   prewarm?: string[]
+  /**
+   * Max consecutive failed grant-cli materializations per workspace before the
+   * workspace is pinned to the `failed` state (bounded retry, invariant #8:
+   * "Agent gets bounded retry"). Once failed, automatic retries stop — the
+   * workspace stays fail-closed (writes denied) until an operator or agent
+   * calls {@link TopolyteWindowsAclProvider.retryWorkspaceGrant} to reset the
+   * counter. Default 3; 0 disables automatic retries entirely.
+   */
+  maxGrantRetries?: number
 }
 
 /**
@@ -156,6 +165,7 @@ export class TopolyteWindowsAclProvider extends SandboxProvider {
   // Inline schema call: the config catalog walks `static Config` statically.
   static Config: z<Config> = z.object({
     prewarm: z.array(z.string()).default([]),
+    maxGrantRetries: z.number().min(0).step(1).default(3),
   })
 
   /** Test hook (mirrors the official executors' `internals`). */
@@ -163,6 +173,8 @@ export class TopolyteWindowsAclProvider extends SandboxProvider {
 
   /** Workspace roots pre-warmed at boot via {@link kickOffWorkspaceGrant} (fire-and-forget). */
   private readonly prewarmWorkspaces: string[]
+  /** Consecutive grant failures that pin a workspace to the `failed` state (bounded retry, invariant #8). */
+  private readonly maxGrantRetries: number
   /**
    * Server-lifetime write grants: the STANDING workspace-root grant per
    * workspace (its ACE is the cross-session reuse cache and outlives the
@@ -180,15 +192,30 @@ export class TopolyteWindowsAclProvider extends SandboxProvider {
    * workspace simply stays fail-closed until a retry lands).
    */
   private readonly workspaceGrantInflight = new Map<string, Promise<void>>()
+  /**
+   * Consecutive failed grant-cli materializations per workspace (bounded
+   * retry, invariant #8). Once a workspace reaches {@link Config.maxGrantRetries},
+   * it is pinned to the `failed` state: automatic retries stop and writes stay
+   * fail-closed until {@link retryWorkspaceGrant} resets the counter.
+   */
+  private readonly workspaceGrantFailures = new Map<string, number>()
 
   constructor(ctx: Context, config: Config) {
     super(ctx)
     this.prewarmWorkspaces = config.prewarm as string[]
+    this.maxGrantRetries = config.maxGrantRetries as number
     // The temp grants are revoked with the provider: a clean server shutdown
     // leaves no temp ACEs behind (workspace ACEs stand by design — the reuse
     // cache; an unclean shutdown leaves them for the next provision's
-    // exact-ACE skip).
-    ctx.effect(() => () => {
+    // exact-ACE skip). Shutdown also OBSERVES any in-flight grant-cli helper
+    // (invariant #7): an async disposer waits for every spawned helper to
+    // settle before revoking — a helper that is still walking must neither be
+    // orphaned nor revoked mid-flight (its standing ACE is never revoked, but
+    // its SID record in `workspaceGrants` is only valid after the helper
+    // succeeded, so revoking before settlement would dispose a half-recorded
+    // grant).
+    ctx.effect(() => async () => {
+      await Promise.allSettled([...this.workspaceGrantInflight.values()])
       this.revokeAclGrants()
     })
     // Pre-warm the configured workspaces' standing grants out-of-band at boot
@@ -218,6 +245,31 @@ export class TopolyteWindowsAclProvider extends SandboxProvider {
   }
 
   /**
+   * The workspace-grant lifecycle state for one workspace root (invariant #5's
+   * "Ready state is explicit", exposed as a query so agents/executors can
+   * distinguish preparing / ready / failed instead of guessing).
+   */
+  workspaceGrantState(workspaceRoot: string): 'preparing' | 'ready' | 'failed' {
+    if (this.workspaceGrants.has(workspaceRoot)) return 'ready'
+    if (this.workspaceGrantInflight.has(workspaceRoot)) return 'preparing'
+    const failures = this.workspaceGrantFailures.get(workspaceRoot) ?? 0
+    return failures >= this.maxGrantRetries ? 'failed' : 'preparing'
+  }
+
+  /**
+   * Reset a workspace's consecutive-failure counter and kick off the grant
+   * again (invariant #8's bounded-retry escape hatch: after `failed`, automatic
+   * retries stop; an operator or agent calls this to explicitly retry).
+   * @param workspaceRoot - the absolute workspace root to re-grant.
+   * @returns the in-flight grant promise (see {@link ensureWorkspaceGrant}).
+   */
+  retryWorkspaceGrant(workspaceRoot: string): Promise<void> {
+    this.workspaceGrantFailures.delete(workspaceRoot)
+    this.kickOffWorkspaceGrant(workspaceRoot)
+    return this.workspaceGrantInflight.get(workspaceRoot) ?? Promise.resolve()
+  }
+
+  /**
    * Start (or join) the out-of-band materialization of one workspace's
    * standing write grant. Coalesces concurrent first-time calls for one
    * workspace onto one grant-cli spawn; a standing grant or an already
@@ -227,18 +279,33 @@ export class TopolyteWindowsAclProvider extends SandboxProvider {
    * failure is LOGGED — it never rejects, so fire-and-forget callers stay
    * unblocked and the workspace simply stays fail-closed (writes denied) until
    * a retry lands. The event loop is NEVER blocked.
+   *
+   * Bounded retry (invariant #8): after {@link Config.maxGrantRetries}
+   * consecutive failures the workspace is pinned to `failed` and automatic
+   * retries stop — {@link workspaceGrantState} reports `failed` and writes
+   * stay denied until {@link retryWorkspaceGrant} resets the counter.
    * @param workspaceRoot - the absolute workspace root to grant.
    */
   private kickOffWorkspaceGrant(workspaceRoot: string): void {
     if (this.workspaceGrants.has(workspaceRoot)) return
     if (this.workspaceGrantInflight.has(workspaceRoot)) return
+    if ((this.workspaceGrantFailures.get(workspaceRoot) ?? 0) >= this.maxGrantRetries) return
     const pending = this.materializeWorkspaceGrantAsync(workspaceRoot).finally(() => {
       this.workspaceGrantInflight.delete(workspaceRoot)
     })
     this.workspaceGrantInflight.set(workspaceRoot, pending)
     // Attach a handler so the returned promise never trips an unhandled
     // rejection for fire-and-forget callers; awaiting callers still observe
-    // the rejection through the same promise.
+    // the rejection through the same promise. Success clears the failure
+    // counter; failure increments it (bounded by maxGrantRetries).
+    pending.then(
+      () => {
+        this.workspaceGrantFailures.delete(workspaceRoot)
+      },
+      () => {
+        this.workspaceGrantFailures.set(workspaceRoot, (this.workspaceGrantFailures.get(workspaceRoot) ?? 0) + 1)
+      },
+    )
     pending.catch((error) => {
       this.ctx.logger.warn(`windows-acl: out-of-band workspace grant failed for ${workspaceRoot}: ${String(error)}`)
     })
