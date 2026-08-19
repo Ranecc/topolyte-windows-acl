@@ -57,6 +57,18 @@ From the npm registry (after `npm publish` — the same one-liner as any plugin)
 dsh plugin --profile <name> add @topolyte/windows-acl
 ```
 
+> **First install on a fresh profile:** pnpm 11 blocks `koffi`'s postinstall
+> build script by default (`ERR_PNPM_IGNORED_BUILDS: Ignored build scripts:
+> koffi@3.1.5`). Allow it once in the profile's `pnpm-workspace.yaml`:
+>
+> ```yaml
+> allowBuilds:
+>   koffi: true
+> ```
+>
+> This is pnpm 11's universal behavior for native-module dependencies — the
+> upstream windows-acl backend requires the same approval.
+
 From a GitHub release tarball (no registry needed — download the `.tgz`
 attached to the release):
 
