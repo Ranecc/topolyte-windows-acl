@@ -1,13 +1,15 @@
 /**
  * TopolyteWindowsAclProvider 测试：验证独立 @topolyte/windows-acl 沙箱 provider
- * 的非阻塞授权语义。Win32 ACL 原生面（AclWriteGrant / assertTempRootOutsideWorkspace /
- * workspaceWriteSid / tempWriteSid）整体 mock，授权树遍历真实发生的部分在官方
+ * 的非阻塞授权语义 + 十项修复不变量（对齐社区手册
+ * `deepseek-harness-handbook/windows-acl-first-run.html`）。Win32 ACL 原生面
+ * （AclWriteGrant / assertTempRootOutsideWorkspace / workspaceWriteSid /
+ * tempWriteSid）整体 mock，授权树遍历真实发生的部分在官方
  * `@deepseek-ai/dsh-sandbox-windows-acl` 的 runner 套件里覆盖。
  *
  * 与 fork 的 sandbox-local `acl-grants.spec.ts` 的差异：本 provider 的 workspace
- * standing grant 是**异步**物化的（grant-cli 子进程），因此所有"materialize
- * workspace grant"断言都放在 `await ensureWorkspaceGrant()` 之后，而不是 confine
- * 返回的同步瞬间。
+ * standing grant 是**异步**物化的（grant-cli 子进程），且授权确认前命令不启动
+ * （invariant #2），因此所有 workspace-write 的 confine 断言都放在
+ * `await ensureWorkspaceGrant()`（或 grant 已确认）之后。
  * @module @topolyte/windows-acl/tests
  */
 
@@ -76,9 +78,9 @@ function materializeWorkspaceGrant(sandbox: TopolyteWindowsAclProvider, workspac
   return sandbox.ensureWorkspaceGrant(workspaceRoot)
 }
 
-async function setup() {
+async function setup(config: Record<string, unknown> = {}) {
   const ctx = new Context()
-  const fiber = await ctx.plugin(TopolyteWindowsAclProvider, {})
+  const fiber = await ctx.plugin(TopolyteWindowsAclProvider, config)
   const sandbox = ctx.sandbox as TopolyteWindowsAclProvider
   sandbox.internals = { platform: 'win32', windowsAclRunnerArgs: ['node', 'windows-acl-runner.js'] }
   return { ctx, sandbox, fiber }
@@ -123,6 +125,10 @@ describe('windows-acl write grants (TopolyteWindowsAclProvider)', () => {
       sandbox.internals.spawnGrant = async (argv, workspaceRoot) => { spawnCalls.push({ argv: [...argv], workspaceRoot }) }
       const policy: SandboxPolicy = { mode: 'workspace-write', workspaceRoot: ws, sessionId: SessionId('sess-1') }
 
+      // 授权确认（out-of-band grant-cli）后才允许启动命令（invariant #2）。
+      await materializeWorkspaceGrant(sandbox, ws)
+      expect(spawnCalls).toEqual([{ argv: ['node', 'grant-cli.js', ws], workspaceRoot: ws }])
+
       const confined = sandbox.confine(['pwsh', '/Command', 'x'], policy)
       const tempDir = flag(confined.argv, '--temp')
       const tempSid = flag(confined.argv, '--temp-write-sid')
@@ -140,17 +146,12 @@ describe('windows-acl write grants (TopolyteWindowsAclProvider)', () => {
         '--',
         'pwsh', '/Command', 'x',
       ])
-      // confine 同步返回后：temp grant 已物化，workspace grant 已在途（grant-cli 子进程）。
-      expect(mockState.grants).toHaveLength(1)
-      expect(mockState.grants[0]?.writeSid).toBe(tempSid)
-      expect(spawnCalls).toHaveLength(1)
-      expect(spawnCalls[0]).toEqual({ argv: ['node', 'grant-cli.js', ws], workspaceRoot: ws })
-
-      // 等待 out-of-band 落地：workspace standing grant 记录、temp grant 复用、二次 confine 同 argv。
-      // workspace grant 是无 add 的 SID 持有者（ACE 由 grant-cli 子进程落地），仅记录以便 dispose。
-      await materializeWorkspaceGrant(sandbox, ws)
+      // confine 返回后：temp grant 已物化（同步）；workspace grant 由 grant-cli
+      // 在途落地（SID 持有者，无 add —— ACE 由子进程落地）。
       expect(mockState.grants).toHaveLength(2)
       expect(mockState.grants.some(grant => grant.writeSid === WORKSPACE_SID && grant.added.length === 0)).toBe(true)
+
+      // 二次 confine 复用 temp capability 与 standing grant；不再 spawn helper。
       expect(sandbox.confine(['pwsh', '/Command', 'x'], policy).argv).toEqual(confined.argv)
       expect(spawnCalls).toHaveLength(1)
 
@@ -182,11 +183,10 @@ describe('windows-acl write grants (TopolyteWindowsAclProvider)', () => {
       ])
       expect(mockState.grants).toHaveLength(0)
 
+      await materializeWorkspaceGrant(sandbox, ws)
       const upgraded = sandbox.confine(['true'], workspaceWrite)
       expect(flag(upgraded.argv, '--temp-write-sid')).not.toBe(WORKSPACE_SID)
-      expect(mockState.grants).toHaveLength(1) // temp 同步；workspace 在途
-      await materializeWorkspaceGrant(sandbox, ws)
-      expect(mockState.grants).toHaveLength(2)
+      expect(mockState.grants).toHaveLength(2) // temp 同步 + workspace standing
       sandbox.confine(['true'], readOnly)
       expect(mockState.grants).toHaveLength(2)
       expect(mockState.grants.every(grant => !grant.disposed)).toBe(true)
@@ -204,6 +204,10 @@ describe('windows-acl write grants (TopolyteWindowsAclProvider)', () => {
       const wsA = workspaceRoot()
       const wsB = workspaceRoot()
       scratch.push(wsA, wsB)
+      sandbox.internals.grantCliArgs = ['node', 'grant-cli.js']
+      sandbox.internals.spawnGrant = async () => { /* out-of-band helper; no-op for this test */ }
+      // 两个 workspace 都先确认授权，命令才允许启动。
+      await Promise.all([materializeWorkspaceGrant(sandbox, wsA), materializeWorkspaceGrant(sandbox, wsB)])
       const parent = sandbox.confine(['true'], { mode: 'workspace-write', workspaceRoot: wsA, sessionId: SessionId('parent') })
       const child = sandbox.confine(['true'], { mode: 'workspace-write', workspaceRoot: wsA, sessionId: SessionId('child') })
       const moved = sandbox.confine(['true'], { mode: 'workspace-write', workspaceRoot: wsB, sessionId: SessionId('parent') })
@@ -211,7 +215,8 @@ describe('windows-acl write grants (TopolyteWindowsAclProvider)', () => {
       expect(flag(child.argv, '--temp')).not.toBe(flag(parent.argv, '--temp'))
       expect(flag(child.argv, '--temp-write-sid')).not.toBe(flag(parent.argv, '--temp-write-sid'))
       expect(flag(moved.argv, '--temp')).not.toBe(flag(parent.argv, '--temp'))
-      expect(mockState.grants).toHaveLength(3) // 同步 temp：A/parent、A/child、B/parent；workspace 均在途
+      // 同步 temp：A/parent、A/child、B/parent；workspace：A、B（standing）。
+      expect(mockState.grants).toHaveLength(5)
 
       await fiber.dispose()
     } finally {
@@ -224,12 +229,15 @@ describe('windows-acl write grants (TopolyteWindowsAclProvider)', () => {
       const { sandbox } = await setup()
       const ws = workspaceRoot()
       scratch.push(ws)
+      sandbox.internals.grantCliArgs = ['node', 'grant-cli.js']
+      sandbox.internals.spawnGrant = async () => { /* out-of-band helper; no-op for this test */ }
+      await materializeWorkspaceGrant(sandbox, ws)
 
       mockState.createTempFailure = new Error('temp SID creation exploded')
       expect(() => sandbox.confine(['true'], {
         mode: 'workspace-write', workspaceRoot: ws, sessionId: SessionId('create-fail'),
       })).toThrow('temp SID creation exploded')
-      expect(mockState.grants).toHaveLength(0) // temp 失败被回滚；workspace 在途（后台，无断言）
+      expect(mockState.grants).toHaveLength(1) // 仅 workspace standing；temp 创建失败被回滚
 
       mockState.createTempFailure = undefined
       mockState.addFailureStanding = false
@@ -295,13 +303,13 @@ describe('windows-acl write grants (TopolyteWindowsAclProvider)', () => {
       scratch.push(ws)
       sandbox.internals.grantCliArgs = ['node', 'grant-cli.js']
       sandbox.internals.spawnGrant = async () => { /* out-of-band helper; no-op for this test */ }
+      await materializeWorkspaceGrant(sandbox, ws)
       const confined = sandbox.confine(['true'], {
         mode: 'workspace-write', workspaceRoot: ws, sessionId: SessionId('dispose'),
       })
       const tempDir = flag(confined.argv, '--temp') ?? ''
-      // 让 out-of-band workspace grant 先落地，teardown 才有 3 个失败可报
-      // （workspace dispose + temp dispose + temp 目录删除）。
-      await materializeWorkspaceGrant(sandbox, ws)
+      // 授权已确认：workspace standing + temp 都在 mockState.grants 里，teardown
+      // 有 3 个失败可报（workspace dispose + temp dispose + temp 目录删除）。
       mockState.disposeFailure = new Error('revoke exploded')
       sandbox.internals.rmTempDir = () => { throw new Error('rm exploded') }
       const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
@@ -328,7 +336,7 @@ describe('windows-acl write grants (TopolyteWindowsAclProvider)', () => {
       }
       const policy: SandboxPolicy = { mode: 'workspace-write', workspaceRoot: ws, sessionId: SessionId('sess-1') }
 
-      // 并发首调合并到一次 helper spawn。
+      // 并发首调合并到一次 helper spawn（invariant #3）。
       await Promise.all([
         sandbox.ensureWorkspaceGrant(ws),
         sandbox.ensureWorkspaceGrant(ws),
@@ -362,32 +370,11 @@ describe('windows-acl write grants (TopolyteWindowsAclProvider)', () => {
       sandbox.internals.spawnGrant = async () => { throw new Error('grant helper exploded') }
 
       await expect(sandbox.ensureWorkspaceGrant(ws)).rejects.toThrow('grant helper exploded')
-      // in-flight 缓存无残留：下一次调用重新 spawn。
+      // in-flight 缓存无残留：下一次调用重新 spawn（failures=1 < maxRetries=3）。
       let calls = 0
       sandbox.internals.spawnGrant = async () => { calls++ }
       await sandbox.ensureWorkspaceGrant(ws)
       expect(calls).toBe(1)
-
-      await fiber.dispose()
-    } finally {
-      cleanup()
-    }
-  })
-
-  it('ensureWorkspaceGrant is a no-op for a workspace the synchronous path already granted', async () => {
-    try {
-      const { sandbox, fiber } = await setup()
-      const ws = workspaceRoot()
-      scratch.push(ws)
-      sandbox.internals.grantCliArgs = ['node', 'grant-cli.js']
-      const spawnCalls: string[] = []
-      sandbox.internals.spawnGrant = async (argv) => { spawnCalls.push(argv.join(' ')) }
-      sandbox.confine(['true'], { mode: 'workspace-write', workspaceRoot: ws, sessionId: SessionId('sync') })
-      await materializeWorkspaceGrant(sandbox, ws)
-      expect(mockState.grants.some(grant => grant.writeSid === WORKSPACE_SID)).toBe(true)
-
-      await sandbox.ensureWorkspaceGrant(ws)
-      expect(spawnCalls).toHaveLength(1) // 首次 confine 已 kick off；再次 ensure 是 no-op
 
       await fiber.dispose()
     } finally {
@@ -416,5 +403,173 @@ describe('windows-acl write grants (TopolyteWindowsAclProvider)', () => {
       { allowedExitCodes: [127], fatalSignatures: ['windows-acl-run: '] },
     ])
     await fiber.dispose()
+  })
+
+  it('invariant #2: a workspace-write command does not start until the grant is confirmed', async () => {
+    try {
+      const { sandbox, fiber } = await setup()
+      const ws = workspaceRoot()
+      scratch.push(ws)
+      sandbox.internals.grantCliArgs = ['node', 'grant-cli.js']
+      // 挂起的 grant-cli：helper 已 spawn，但永不 settle（模拟分钟级大树遍历）。
+      let pendingResolve: () => void = () => {}
+      sandbox.internals.spawnGrant = () => new Promise<void>((resolve) => { pendingResolve = resolve })
+
+      // 触发挂起授权（不 await —— 这是 in-flight 的 prewarm/首次触发）。
+      void sandbox.ensureWorkspaceGrant(ws)
+      expect(sandbox.workspaceGrantState(ws)).toBe('preparing')
+
+      // 授权未确认：confine 同步抛 SandboxUnavailableError（fail-closed 拒绝），
+      // 事件循环不被阻塞 —— 耗时断言证明 confine 没有 await 挂起的 grant。
+      const started = Date.now()
+      expect(() => sandbox.confine(['true'], {
+        mode: 'workspace-write', workspaceRoot: ws, sessionId: SessionId('prep'),
+      })).toThrow(SandboxUnavailableError)
+      expect(() => sandbox.confine(['true'], {
+        mode: 'workspace-write', workspaceRoot: ws, sessionId: SessionId('prep'),
+      })).toThrow(/is 'preparing'/u)
+      expect(Date.now() - started).toBeLessThan(200)
+
+      // 授权落地 → ready → 命令允许启动。
+      pendingResolve()
+      await sandbox.ensureWorkspaceGrant(ws)
+      expect(sandbox.workspaceGrantState(ws)).toBe('ready')
+      const confined = sandbox.confine(['true'], {
+        mode: 'workspace-write', workspaceRoot: ws, sessionId: SessionId('prep'),
+      })
+      expect(flag(confined.argv, '--write-sid')).toBe(WORKSPACE_SID)
+
+      await fiber.dispose()
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('invariant #8: bounded retry pins a workspace to failed; retryWorkspaceGrant resets it', async () => {
+    try {
+      const { sandbox, fiber } = await setup({ maxGrantRetries: 2 })
+      const ws = workspaceRoot()
+      scratch.push(ws)
+      sandbox.internals.grantCliArgs = ['node', 'grant-cli.js']
+      sandbox.internals.spawnGrant = async () => { throw new Error('grant helper exploded') }
+
+      // 连续失败达到 maxGrantRetries → 状态 pinned 到 failed。
+      await expect(sandbox.ensureWorkspaceGrant(ws)).rejects.toThrow('grant helper exploded') // failures=1
+      await expect(sandbox.ensureWorkspaceGrant(ws)).rejects.toThrow('grant helper exploded') // failures=2
+      expect(sandbox.workspaceGrantState(ws)).toBe('failed')
+
+      // 自动重试停止：第三次 ensure 不再 spawn（bounded），resolve 但不授权。
+      let calls = 0
+      sandbox.internals.spawnGrant = async () => { calls++ }
+      await sandbox.ensureWorkspaceGrant(ws)
+      expect(calls).toBe(0)
+      expect(sandbox.workspaceGrantState(ws)).toBe('failed')
+
+      // failed 状态同样拒绝启动命令，且错误信息给出逃生通道。
+      expect(() => sandbox.confine(['true'], {
+        mode: 'workspace-write', workspaceRoot: ws, sessionId: SessionId('pinned'),
+      })).toThrow(SandboxUnavailableError)
+      expect(() => sandbox.confine(['true'], {
+        mode: 'workspace-write', workspaceRoot: ws, sessionId: SessionId('pinned'),
+      })).toThrow(/is 'failed'/u)
+      expect(() => sandbox.confine(['true'], {
+        mode: 'workspace-write', workspaceRoot: ws, sessionId: SessionId('pinned'),
+      })).toThrow(/retryWorkspaceGrant/u)
+
+      // 逃生通道：retryWorkspaceGrant 重置计数 → helper 成功后 ready → 命令可启动。
+      sandbox.internals.spawnGrant = async () => { /* now succeeds */ }
+      await sandbox.retryWorkspaceGrant(ws)
+      expect(sandbox.workspaceGrantState(ws)).toBe('ready')
+      const confined = sandbox.confine(['true'], {
+        mode: 'workspace-write', workspaceRoot: ws, sessionId: SessionId('pinned'),
+      })
+      expect(flag(confined.argv, '--write-sid')).toBe(WORKSPACE_SID)
+
+      await fiber.dispose()
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('invariant #3/#6: canonical path spellings dedup to one grant and one SID', async () => {
+    try {
+      const { sandbox, fiber } = await setup()
+      const ws = workspaceRoot()
+      scratch.push(ws)
+      sandbox.internals.grantCliArgs = ['node', 'grant-cli.js']
+      const spawnCalls: string[] = []
+      sandbox.internals.spawnGrant = async (argv) => { spawnCalls.push(argv.join(' ')) }
+
+      await sandbox.ensureWorkspaceGrant(ws)
+      // 同一目录的不同拼写（尾分隔符 / "." 段 / 大小写）合并到同一 canonical 键。
+      await sandbox.ensureWorkspaceGrant(`${ws}\\`)
+      await sandbox.ensureWorkspaceGrant(`${ws}\\.`)
+      if (process.platform === 'win32') await sandbox.ensureWorkspaceGrant(ws.toUpperCase())
+      expect(spawnCalls).toHaveLength(1)
+      expect(sandbox.workspaceGrantState(`${ws}\\`)).toBe('ready')
+
+      // 不同拼写也能启动命令，且 runner 收到的是 canonical 路径（无尾分隔符）。
+      const confined = sandbox.confine(['true'], {
+        mode: 'workspace-write', workspaceRoot: `${ws}\\`, sessionId: SessionId('canon'),
+      })
+      expect(flag(confined.argv, '--workspace')).toBe(realpathSync.native(ws))
+      expect(flag(confined.argv, '--workspace')).not.toMatch(/[\\/]$/u)
+
+      await fiber.dispose()
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('invariant #1/#10: a pending grant never stalls unrelated confinement (event loop responds)', async () => {
+    try {
+      const { sandbox, fiber } = await setup()
+      const wsA = workspaceRoot()
+      const wsB = workspaceRoot()
+      scratch.push(wsA, wsB)
+      sandbox.internals.grantCliArgs = ['node', 'grant-cli.js']
+      let pendingResolve: () => void = () => {}
+      sandbox.internals.spawnGrant = (argv) => {
+        // 只有 A 挂起；B 立即成功。
+        if (argv.includes(wsB)) return Promise.resolve()
+        return new Promise<void>((resolve) => { pendingResolve = resolve })
+      }
+      await materializeWorkspaceGrant(sandbox, wsB)
+      void sandbox.ensureWorkspaceGrant(wsA) // 挂起，不 await
+      expect(sandbox.workspaceGrantState(wsA)).toBe('preparing')
+
+      // A 的授权挂起时，B 的 workspace-write 与 A 的 read-only 都立即返回。
+      const started = Date.now()
+      const bConfined = sandbox.confine(['true'], { mode: 'workspace-write', workspaceRoot: wsB, sessionId: SessionId('b') })
+      sandbox.confine(['true'], { mode: 'read-only', workspaceRoot: wsA })
+      expect(flag(bConfined.argv, '--write-sid')).toBe(WORKSPACE_SID)
+      expect(Date.now() - started).toBeLessThan(200)
+
+      pendingResolve()
+      await fiber.dispose()
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('invariant #7: shutdown observes the in-flight grant helper before revoking', async () => {
+    const { sandbox, fiber } = await setup()
+    const ws = workspaceRoot()
+    scratch.push(ws)
+    sandbox.internals.grantCliArgs = ['node', 'grant-cli.js']
+    let pendingResolve: () => void = () => {}
+    sandbox.internals.spawnGrant = () => new Promise<void>((resolve) => { pendingResolve = resolve })
+    void sandbox.ensureWorkspaceGrant(ws) // in-flight 挂起
+
+    // dispose 必须等待 in-flight helper settle，而不是中途撤销。
+    const disposing = fiber.dispose()
+    let disposed = false
+    disposing.then(() => { disposed = true })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(disposed).toBe(false) // 授权未 settle，dispose 仍在等待（invariant #7）
+
+    pendingResolve()
+    await disposing
+    expect(disposed).toBe(true)
   })
 })

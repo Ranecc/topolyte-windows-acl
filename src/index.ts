@@ -7,22 +7,24 @@
  *
  * - workspace 的 standing write ACE 传播（大型目录树上的继承式 ACL 遍历可达
  *   分钟级）运行在独立的 grant-cli 子进程里，主事件循环永远不被阻塞；
- * - `confine()` 内部在需要 workspace-write 时 kick off 异步授权（fire-and-forget、
- *   同 workspace 并发合并），命令路径不等待授权完成——ACE 落地前写入被拒
- *   （fail-closed，安全而非卡死）；
+ * - `confine()` 内部在需要 workspace-write 时 kick off 异步授权（同 workspace
+ *   并发合并）；**授权确认前命令不启动**（invariant #2 的 fail-closed 拒绝，
+ *   preparing 时抛 SandboxUnavailableError，Agent 重试直到授权落地），授权
+ *   落地后每条命令命中 exact-ACE skip（O(1)）；
  * - 每个 session/workspace 对获得一个随机私有 temp 目录及其独立 capability
  *   SID（temp ACE 随 provider dispose 撤销；workspace ACE 是跨 session 的
  *   standing 复用缓存，永不撤销）。
  *
  * 官方 npm 的 `SandboxProvider` 基类没有 `ensureWorkspaceGrant` 抽象（fork
  * 才加的），因此本 provider 把它作为自有公开方法提供（非 override）：官方
- * executor 不调用它也能工作，因为 `confine()` 内部已内聚异步授权；需要预授权/
- * 预热（bundle 配置 prewarm）的调用方可直接调用它并可选 await。
+ * executor 不调用它也能工作——`confine()` 内部已内聚异步授权，首次命令在
+ * 授权落地前被 fail-closed 拒绝（Agent 重试即可）；需要平滑首次体验的部署
+ * 可用 bundle 配置 prewarm 在 boot 预热，或显式 `await ensureWorkspaceGrant()`。
  * @module @topolyte/windows-acl
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -94,6 +96,33 @@ function defaultSpawnGrant(argv: string[], workspaceRoot: string): Promise<void>
       ))
     })
   })
+}
+
+/**
+ * Canonicalize one workspace root for SID derivation and map keys
+ * (invariants #3/#6): converge case / alias / trailing-separator spellings of
+ * ONE directory onto ONE key, so a workspace's standing grant, in-flight
+ * promise, failure counter, and write SID all agree. The official
+ * `workspaceWriteSid` contract requires the canonical path
+ * (`realpathSync.native` on Windows); an as-spelled fallback would mint a
+ * SECOND identity for one directory (one extra tree propagation) and defeat
+ * same-path dedup.
+ * @param root - the workspace root as the caller spelled it.
+ * @returns the canonical absolute form (realpath when it exists, else the
+ *   trailing-separator-normalized spelling so a not-yet-checked-out path is
+ *   still stable as a map key; the grant helper fails closed if the path
+ *   still does not exist at materialization time).
+ */
+function canonicalWorkspaceRootSync(root: string): string {
+  try {
+    const real = realpathSync.native(root)
+    // realpathSync.native returns the \\?\ long-path form on Windows; strip
+    // the prefix so keys and SIDs stay in the plain form the runner and
+    // workspaceWriteSid expect.
+    return real.startsWith('\\\\?\\') ? real.slice(4) : real
+  } catch {
+    return root.replace(/[\\/]+$/u, '')
+  }
 }
 
 /** Test hook: inject probe verdicts / a fake grant spawn / a fake runner. */
@@ -199,6 +228,13 @@ export class TopolyteWindowsAclProvider extends SandboxProvider {
    * fail-closed until {@link retryWorkspaceGrant} resets the counter.
    */
   private readonly workspaceGrantFailures = new Map<string, number>()
+  /**
+   * Canonicalized workspace-root cache (invariant #3/#6): every map key and
+   * every `workspaceWriteSid` input go through {@link canonicalWorkspaceRoot}
+   * so one directory has ONE key even when callers spell it differently
+   * (case / alias / trailing separator). Keyed by the as-spelled input.
+   */
+  private readonly canonicalRoots = new Map<string, string>()
 
   constructor(ctx: Context, config: Config) {
     super(ctx)
@@ -245,69 +281,106 @@ export class TopolyteWindowsAclProvider extends SandboxProvider {
   }
 
   /**
+   * Canonicalize one workspace root (cached): every map key and every
+   * `workspaceWriteSid` input MUST agree on one spelling per directory
+   * (invariant #3: "one in-flight grant per path"; #6: "moved path gets new
+   * SID" — renaming derives a new SID, while re-spelling does not). The
+   * result is what reaches the grant-cli child and the runner's `--workspace`
+   * flag, so the ACE the helper lays down matches the SID the runner carries.
+   * @param workspaceRoot - the workspace root as the caller spelled it.
+   */
+  private canonicalWorkspaceRoot(workspaceRoot: string): string {
+    const cached = this.canonicalRoots.get(workspaceRoot)
+    if (cached !== undefined) return cached
+    const canonical = canonicalWorkspaceRootSync(workspaceRoot)
+    this.canonicalRoots.set(workspaceRoot, canonical)
+    return canonical
+  }
+
+  /**
+   * Whether a workspace's consecutive-failure counter has pinned it to the
+   * `failed` state (invariant #8): strictly MORE than zero consecutive
+   * failures AND at or above {@link maxGrantRetries}. A never-failed
+   * workspace is never `failed` even when `maxGrantRetries` is 0 (which
+   * disables automatic RETRIES, not the first attempt).
+   * @param root - the canonical workspace root.
+   */
+  private grantFailed(root: string): boolean {
+    const failures = this.workspaceGrantFailures.get(root) ?? 0
+    return failures > 0 && failures >= this.maxGrantRetries
+  }
+
+  /**
    * The workspace-grant lifecycle state for one workspace root (invariant #5's
    * "Ready state is explicit", exposed as a query so agents/executors can
    * distinguish preparing / ready / failed instead of guessing).
+   * @param workspaceRoot - the workspace root (any spelling of it).
    */
   workspaceGrantState(workspaceRoot: string): 'preparing' | 'ready' | 'failed' {
-    if (this.workspaceGrants.has(workspaceRoot)) return 'ready'
-    if (this.workspaceGrantInflight.has(workspaceRoot)) return 'preparing'
-    const failures = this.workspaceGrantFailures.get(workspaceRoot) ?? 0
-    return failures >= this.maxGrantRetries ? 'failed' : 'preparing'
+    const root = this.canonicalWorkspaceRoot(workspaceRoot)
+    if (this.workspaceGrants.has(root)) return 'ready'
+    if (this.workspaceGrantInflight.has(root)) return 'preparing'
+    return this.grantFailed(root) ? 'failed' : 'preparing'
   }
 
   /**
    * Reset a workspace's consecutive-failure counter and kick off the grant
    * again (invariant #8's bounded-retry escape hatch: after `failed`, automatic
    * retries stop; an operator or agent calls this to explicitly retry).
-   * @param workspaceRoot - the absolute workspace root to re-grant.
+   * @param workspaceRoot - the absolute workspace root to re-grant (any spelling).
    * @returns the in-flight grant promise (see {@link ensureWorkspaceGrant}).
    */
   retryWorkspaceGrant(workspaceRoot: string): Promise<void> {
-    this.workspaceGrantFailures.delete(workspaceRoot)
-    this.kickOffWorkspaceGrant(workspaceRoot)
-    return this.workspaceGrantInflight.get(workspaceRoot) ?? Promise.resolve()
+    const root = this.canonicalWorkspaceRoot(workspaceRoot)
+    this.workspaceGrantFailures.delete(root)
+    this.kickOffWorkspaceGrant(root)
+    return this.workspaceGrantInflight.get(root) ?? Promise.resolve()
   }
 
   /**
    * Start (or join) the out-of-band materialization of one workspace's
    * standing write grant. Coalesces concurrent first-time calls for one
-   * workspace onto one grant-cli spawn; a standing grant or an already
-   * in-flight materialization is a no-op. On grant-cli success the workspace
-   * grant is recorded so {@link confine}'s provision hits the exact-ACE skip
-   * (O(1)); on failure the entry is dropped (so the next call retries) and the
-   * failure is LOGGED — it never rejects, so fire-and-forget callers stay
-   * unblocked and the workspace simply stays fail-closed (writes denied) until
+   * workspace onto ONE grant-cli spawn (invariant #3); a standing grant or an
+   * already in-flight materialization is a no-op. On grant-cli success the
+   * workspace grant is recorded so {@link confine}'s provision hits the
+   * exact-ACE skip (O(1)); on failure the entry is dropped (so the next call
+   * retries) and the failure is LOGGED — it never rejects, so fire-and-forget
+   * callers stay unblocked and the workspace simply stays unprovisioned until
    * a retry lands. The event loop is NEVER blocked.
    *
    * Bounded retry (invariant #8): after {@link Config.maxGrantRetries}
    * consecutive failures the workspace is pinned to `failed` and automatic
-   * retries stop — {@link workspaceGrantState} reports `failed` and writes
-   * stay denied until {@link retryWorkspaceGrant} resets the counter.
-   * @param workspaceRoot - the absolute workspace root to grant.
+   * retries stop — {@link workspaceGrantState} reports `failed` and
+   * {@link confine} refuses to start commands until
+   * {@link retryWorkspaceGrant} resets the counter.
+   * @param workspaceRoot - the absolute workspace root to grant (any spelling).
    */
   private kickOffWorkspaceGrant(workspaceRoot: string): void {
-    if (this.workspaceGrants.has(workspaceRoot)) return
-    if (this.workspaceGrantInflight.has(workspaceRoot)) return
-    if ((this.workspaceGrantFailures.get(workspaceRoot) ?? 0) >= this.maxGrantRetries) return
-    const pending = this.materializeWorkspaceGrantAsync(workspaceRoot).finally(() => {
-      this.workspaceGrantInflight.delete(workspaceRoot)
+    const root = this.canonicalWorkspaceRoot(workspaceRoot)
+    if (this.workspaceGrants.has(root)) return
+    if (this.workspaceGrantInflight.has(root)) return
+    // Bounded retry (invariant #8): a workspace pinned to `failed` stops
+    // automatic retries; the FIRST attempt is always allowed even when
+    // maxGrantRetries is 0 (it caps retries, not the first grant).
+    if (this.grantFailed(root)) return
+    const pending = this.materializeWorkspaceGrantAsync(root).finally(() => {
+      this.workspaceGrantInflight.delete(root)
     })
-    this.workspaceGrantInflight.set(workspaceRoot, pending)
+    this.workspaceGrantInflight.set(root, pending)
     // Attach a handler so the returned promise never trips an unhandled
     // rejection for fire-and-forget callers; awaiting callers still observe
     // the rejection through the same promise. Success clears the failure
     // counter; failure increments it (bounded by maxGrantRetries).
     pending.then(
       () => {
-        this.workspaceGrantFailures.delete(workspaceRoot)
+        this.workspaceGrantFailures.delete(root)
       },
       () => {
-        this.workspaceGrantFailures.set(workspaceRoot, (this.workspaceGrantFailures.get(workspaceRoot) ?? 0) + 1)
+        this.workspaceGrantFailures.set(root, (this.workspaceGrantFailures.get(root) ?? 0) + 1)
       },
     )
     pending.catch((error) => {
-      this.ctx.logger.warn(`windows-acl: out-of-band workspace grant failed for ${workspaceRoot}: ${String(error)}`)
+      this.ctx.logger.warn(`windows-acl: out-of-band workspace grant failed for ${root}: ${String(error)}`)
     })
   }
 
@@ -316,21 +389,25 @@ export class TopolyteWindowsAclProvider extends SandboxProvider {
    * OUTSIDE the event loop — the async grant-cli child process owns the eager
    * inheritable-ACE propagation that on a large workspace takes minutes, and
    * the walk NEVER runs on the calling tick. Coalesces concurrent first-time
-   * calls; already-granted workspaces resolve immediately. Callers on the
-   * user-visible request path MUST NOT await this (fire-and-forget it): the
-   * returned promise resolves only once the full-tree walk lands. Off-path
-   * callers (tests, explicit warm-up) may await it to observe completion.
+   * calls (invariant #3); already-granted workspaces resolve immediately.
+   * Awaiting this resolves only once the full-tree walk lands (a large
+   * workspace's FIRST await takes minutes by design); user-visible paths
+   * SHOULD instead call {@link confine} (which refuses to start a command
+   * until the grant is confirmed — invariant #2) and let the agent retry, or
+   * prewarm the workspace at boot. Off-path callers (tests, explicit warm-up)
+   * may await it to observe completion.
    *
    * NOTE: the official npm `SandboxProvider` base class has no such method
    * (the fork added it); this is a provider-owned extension. Official executors
    * work without calling it — `confine()` internally kicks the grant off.
-   * @param workspaceRoot - the absolute workspace root to grant.
+   * @param workspaceRoot - the absolute workspace root to grant (any spelling).
    * @returns a promise resolving once the workspace ACE stands (or was already
    *   standing); rejecting on materialization failure.
    */
   ensureWorkspaceGrant(workspaceRoot: string): Promise<void> {
-    this.kickOffWorkspaceGrant(workspaceRoot)
-    return this.workspaceGrantInflight.get(workspaceRoot) ?? Promise.resolve()
+    const root = this.canonicalWorkspaceRoot(workspaceRoot)
+    this.kickOffWorkspaceGrant(root)
+    return this.workspaceGrantInflight.get(root) ?? Promise.resolve()
   }
 
   /**
@@ -389,13 +466,16 @@ export class TopolyteWindowsAclProvider extends SandboxProvider {
         '--mode', policy.mode,
       ]
     }
-    const temp = this.materializeAclGrant(sessionId, policy.workspaceRoot)
+    // Only the write path canonicalizes: the map keys, the SID, the grant-cli
+    // argument, and the runner's --workspace must all agree on ONE spelling.
+    const root = this.canonicalWorkspaceRoot(policy.workspaceRoot)
+    const temp = this.materializeAclGrant(sessionId, root)
     return [
       ...this.windowsAclRunnerInvocation(),
-      '--workspace', policy.workspaceRoot,
+      '--workspace', root,
       '--temp', temp.dir,
       '--mode', policy.mode,
-      '--write-sid', workspaceWriteSid(policy.workspaceRoot),
+      '--write-sid', workspaceWriteSid(root),
       '--temp-write-sid', temp.writeSid,
     ]
   }
@@ -407,29 +487,46 @@ export class TopolyteWindowsAclProvider extends SandboxProvider {
    * process — this method NEVER walks the tree synchronously (on a large
    * workspace that eager inheritable-ACE propagation takes MINUTES and must not
    * block the harness event loop). If the standing grant is not yet recorded,
-   * the out-of-band materialization is kicked off (coalesced) and provisioning
-   * proceeds: until the ACE lands, the confined child's workspace writes are
-   * denied (fail-closed — safe, never a freeze), and the standing ACE makes
-   * every later provision O(1). The temp directory is random and carries a
-   * distinct SID, so another session on the same workspace cannot use the
-   * shared workspace SID to enter it. A fresh provider always chooses a new
-   * path; crash residue therefore cannot collide with or authorize a resumed
-   * session. Fail-closed: a half-materialized temp grant is revoked and its
-   * directory removed before the error propagates.
+   * the out-of-band materialization is kicked off (coalesced, invariant #3)
+   * and the caller is then checked against the lifecycle state (invariant #5):
+   * a not-yet-confirmed grant REFUSES to start the command (invariant #2) with
+   * a {@link SandboxUnavailableError} carrying the `preparing`/`failed` state;
+   * a confirmed grant proceeds and every later provision is O(1). The temp
+   * directory is random and carries a distinct SID, so another session on the
+   * same workspace cannot use the shared workspace SID to enter it. A fresh
+   * provider always chooses a new path; crash residue therefore cannot collide
+   * with or authorize a resumed session. Fail-closed: a half-materialized temp
+   * grant is revoked and its directory removed before the error propagates.
    * @param sessionId - the policy's calling-session identity.
-   * @param workspaceRoot - the resolved policy root.
+   * @param workspaceRoot - the canonical workspace root.
    * @returns the pair's private temp directory and write capability.
    */
   private materializeAclGrant(sessionId: SessionId, workspaceRoot: string): AclTempCapability {
-    assertTempRootOutsideWorkspace(workspaceRoot, tmpdir())
-    if (!this.workspaceGrants.has(workspaceRoot)) {
+    const root = this.canonicalWorkspaceRoot(workspaceRoot)
+    assertTempRootOutsideWorkspace(root, tmpdir())
+    if (!this.workspaceGrants.has(root)) {
       // The standing workspace grant is materialized by the grant-cli child
       // process out-of-band (kick-off is a no-op when one is already in
-      // flight). The runner receives --write-sid regardless; until its ACE
-      // stands, workspace writes are denied (fail-closed).
-      this.kickOffWorkspaceGrant(workspaceRoot)
+      // flight).
+      this.kickOffWorkspaceGrant(root)
     }
-    const key = JSON.stringify([String(sessionId), workspaceRoot])
+    // Invariant #2: no child may run before the grant is confirmed. Fail-closed
+    // REFUSAL — the command is not started (never a silent half-authorized
+    // run). preparing: retry once the out-of-band walk lands; failed: bounded
+    // retries exhausted, an operator/agent must retryWorkspaceGrant(). The
+    // helper keeps walking in the background either way; the event loop is
+    // never blocked.
+    const state = this.workspaceGrantState(root)
+    if (state !== 'ready') {
+      throw new SandboxUnavailableError(
+        'workspace-write',
+        `windows-acl: workspace grant for ${root} is '${state}'; command not started (invariant #2: no child may run before the grant is confirmed; `
+        + (state === 'failed'
+          ? 'bounded retries exhausted — call retryWorkspaceGrant() to reset)'
+          : 'retry once the grant lands, or prewarm the workspace at boot)'),
+      )
+    }
+    const key = JSON.stringify([String(sessionId), root])
     const existing = this.tempCapabilities.get(key)
     if (existing !== undefined) return existing
     const tempDir = mkdtempSync(join(tmpdir(), 'dsh-'))
