@@ -1,0 +1,14 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib"
+  },
+  "include": [
+    "src"
+  ],
+  // No project references: the DSH host packages (@deepseek-ai/dsh-sandbox /
+  // dsh-sandbox-windows-acl / cordis) resolve through node_modules via their
+  // published type declarations, so this package compiles standalone.
+  "references": []
+}

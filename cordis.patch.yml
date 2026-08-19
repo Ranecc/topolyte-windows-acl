@@ -1,0 +1,39 @@
+# @topolyte/windows-acl bundle patch layer
+#
+# Replaces the official local sandbox provider with the Topolyte Windows ACL
+# provider on ANY dsh profile (official DeepSeek Harness included — no fork
+# needed). Applied as a bundle layer after the profile's in-box bundles
+# (base / web-app / headless), so it can target the base bundle's `sandbox`
+# row by id.
+#
+# Install on the official harness:
+#   dsh plugin --profile <name> add @topolyte/windows-acl
+#
+# The bundle's package.json declares `dsh.bundle.patch`, so `dsh plugin add`
+# reconciles it into `dsh.profile.bundles` automatically and it joins the
+# profile layer stack on every boot.
+#
+# Two actions, in order:
+#  1. DISABLE the official `@deepseek-ai/dsh-sandbox-local` row. The `name`
+#     guard makes the patch fail loudly (warn + skip) if the base bundle ever
+#     renames that row, instead of silently disabling some other `sandbox`.
+#     The base row's platform runner chain (bwrap/landlock/seatbelt/windows-acl)
+#     is irrelevant on a Topolyte install: our provider is Windows-only by
+#     construction and this plugin IS the Windows sandbox.
+#  2. INSERT our provider under its own row id. A distinct id avoids duplicate
+#     `sandbox` ids in the merged entry list — the disabled official row keeps
+#     its id, our provider owns `topolyte-sandbox` and is the ONLY live
+#     `ctx.sandbox` provider (cordis singleton service). `prewarm` mirrors the
+#     fork's base-bundle config: start the standing workspace grant at boot
+#     (fire-and-forget — the walk runs in the grant-cli child process, never
+#     on the event loop).
+- id: sandbox
+  name: '@deepseek-ai/dsh-sandbox-local'
+  disabled: true
+
+- insert:
+    - id: topolyte-sandbox
+      name: '@topolyte/windows-acl'
+      config:
+        prewarm:
+          - !!js process.cwd()
