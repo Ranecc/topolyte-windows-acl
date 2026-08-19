@@ -168,6 +168,19 @@ deepseek-harness checkout itself), run
   landed) cuts it to `confirm prewarmed`, a flat ~325–360ms of Node/tsx cold
   start with the tree walk skipped — tree-size independent.
 
+### Why (the mechanism behind the numbers)
+
+- `grant.add(root, true)` calls `SetNamedSecurityInfoW` with OI|CI inheritance.
+  The kernel **eagerly re-applies the inheritable ACE to every live
+  descendant** — one synchronous call, linear in file count, on the event
+  loop. That is the freeze.
+- The exact-root-ACE skip (`hasExactGrant`) is not an optimization but a guard:
+  re-applying the identical ACE would re-trigger the same O(n) walk. When the
+  guard misses it re-walks (see the long-tail caveat above).
+- Moving the walk into the `grant-cli` child (`spawn`, not `spawnSync`) keeps
+  that O(n) cost off the event loop; the main thread only pays the spawn
+  syscall (~70–120ms, p50 ~15ms), regardless of tree size.
+
 ## Test
 
 ```sh
