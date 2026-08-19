@@ -89,6 +89,22 @@ function probeScript(workspace: string, outside: string, temp: string): string {
   ].join('\n')
 }
 
+/**
+ * 从受限子进程 stdout 中提取探针 JSON。
+ * 探针输出 `E2E_RESULT {...}`——捕获组必须**含外层花括号**（正则写 `\{.*\}` 会把
+ * 花括号吃掉、只剩裸键值对，JSON.parse 会因"完整 value 后跟多余字符"而失败）。
+ * 解析失败返回 null（调用方如实记录，而不是让脚本崩在中间）。
+ */
+function parseProbe(stdout: string): Record<string, string> | null {
+  const m = /E2E_RESULT (\{.*\})/u.exec(stdout)
+  if (!m) return null
+  try {
+    return JSON.parse(m[1] as string) as Record<string, string>
+  } catch {
+    return null
+  }
+}
+
 async function main(): Promise<number> {
   const scratch: string[] = []
   const cleanup = () => {
@@ -141,11 +157,14 @@ async function main(): Promise<number> {
       record('workspace-write 受限子进程（写工作区/写外部/写temp）', 'blocked',
         'TRAE agent 沙箱拦截受限令牌 CreateProcess（exit 2147483653）。请在普通终端跑同命令补全验证。')
     } else {
-      const m = /E2E_RESULT \{(.*)\}/u.exec(result.stdout)
-      const probe = m ? JSON.parse(m[1] as string) as Record<string, string> : {}
-      record('workspace-write: 工作区内可写', probe.workspace === 'WRITE_OK' ? 'pass' : 'fail', `probe.workspace=${probe.workspace}`)
-      record('workspace-write: 工作区外被拒', (probe.outside ?? '').startsWith('WRITE_DENIED') ? 'pass' : 'fail', `probe.outside=${probe.outside}`)
-      record('workspace-write: 私有 temp 可写', probe.temp === 'WRITE_OK' ? 'pass' : 'fail', `probe.temp=${probe.temp}`)
+      const probe = parseProbe(result.stdout)
+      const detail = `probe.workspace=${probe?.workspace ?? 'N/A'}; probe.outside=${probe?.outside ?? 'N/A'}; probe.temp=${probe?.temp ?? 'N/A'}`
+      record('workspace-write: 工作区内可写', probe?.workspace === 'WRITE_OK' ? 'pass' : 'fail',
+        `${detail}\n      stdout=${JSON.stringify(result.stdout.slice(0, 200))}`)
+      record('workspace-write: 工作区外被拒', (probe?.outside ?? '').startsWith('WRITE_DENIED') ? 'pass' : 'fail',
+        `probe.outside=${probe?.outside}`)
+      record('workspace-write: 私有 temp 可写', probe?.temp === 'WRITE_OK' ? 'pass' : 'fail',
+        `probe.temp=${probe?.temp}`)
       record('受限子进程退出码', result.code === 0 ? 'pass' : 'fail', `exit=${result.code}\n      stderr=${result.stderr.trim() || '(empty)'}`)
     }
 
@@ -156,9 +175,9 @@ async function main(): Promise<number> {
     if (roResult.code === SANDBOX_BLOCKED_EXIT) {
       record('read-only 受限子进程（写工作区应被拒）', 'blocked', 'TRAE agent 沙箱拦截受限令牌 CreateProcess（exit 2147483653）')
     } else {
-      const roM = /E2E_RESULT \{(.*)\}/u.exec(roResult.stdout)
-      const roProbe = roM ? JSON.parse(roM[1] as string) as Record<string, string> : {}
-      record('read-only: 工作区写被拒', (roProbe.workspace ?? '').startsWith('WRITE_DENIED') ? 'pass' : 'fail', `probe.workspace=${roProbe.workspace}`)
+      const roProbe = parseProbe(roResult.stdout)
+      record('read-only: 工作区写被拒', (roProbe?.workspace ?? '').startsWith('WRITE_DENIED') ? 'pass' : 'fail',
+        `probe.workspace=${roProbe?.workspace ?? 'N/A'}; stdout=${JSON.stringify(roResult.stdout.slice(0, 200))}`)
     }
 
     // --- 7. teardown：temp ACE 撤销 + 目录删除；workspace standing ACE 保留 ----
