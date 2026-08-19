@@ -19,9 +19,14 @@ Cordis bundle-patch mechanism — **no fork required**.
 - **Non-blocking authorization** — the workspace's standing write ACE is
   materialized out-of-band by a `grant-cli` child process (`spawn`, not
   `spawnSync`); concurrent first-time calls for one workspace coalesce onto a
-  single helper spawn.
-- **Fail-closed, never a freeze** — until the standing ACE lands, the confined
-  child's workspace writes are denied (`access is denied`); once it stands, the
+  single helper spawn, and workspace roots are canonicalized
+  (`realpathSync.native`, per the official `workspaceWriteSid` contract) so
+  every spelling of one directory shares one in-flight grant, one SID, and one
+  failure counter.
+- **Fail-closed, no early child starts** — a workspace-write command is not
+  started until its grant is confirmed: while the grant
+  is `preparing` or `failed`, `confine()` refuses with `SandboxUnavailableError`
+  (never a freeze, never a silent half-authorized run); once it stands, the
   exact-ACE skip makes every later provision O(1).
 - **Standing / revocable lifecycle preserved** — the workspace ACE is the
   cross-session reuse cache (never revoked); each session/workspace pair gets a
@@ -86,11 +91,40 @@ tool-pwsh / tool-bash
   └─ confine() ──► TopolyteWindowsAclProvider (extends SandboxProvider)
        ├─ kickOffWorkspaceGrant(root)      spawn grant-cli child (never awaited)
        │     └─ grant-cli: AclWriteGrant.add(root, standing)  ← full-tree walk HERE
+       ├─ workspaceGrantState(root)        preparing / ready / failed
+       │     └─ not ready → SandboxUnavailableError (command not started)
        └─ runner argv: --workspace --temp --mode --write-sid --temp-write-sid
 ```
 
 The expensive `grantWrite → SetNamedSecurityInfoW` eager inheritance walk runs
 in the `grant-cli` child process, so the harness event loop never blocks.
+
+## Grant lifecycle (preparing / ready / failed)
+
+The out-of-process design is a state-machine change (per the community repair
+invariants in the [DeepSeek Harness Handbook](https://sandbaseai.github.io/deepseek-harness-handbook/windows-acl-first-run.html)):
+no child may run before the grant is confirmed. Each workspace root moves
+through three explicit states, exposed via `workspaceGrantState(root)`:
+
+```mermaid
+stateDiagram-v2
+    [*] --> preparing: kickOffWorkspaceGrant (grant-cli child spawned)
+    preparing --> ready: helper exit 0 → standing ACE stands
+    preparing --> failed: helper exit 127 × maxGrantRetries
+    failed --> preparing: retryWorkspaceGrant() resets the counter
+    ready --> ready: exact-ACE skip (O(1) per command)
+    ready --> [*]: provider dispose (standing ACE stays; temp ACEs revoked)
+```
+
+- `preparing` — the grant is walking in the background (minutes on a large
+  tree); `confine()` refuses to start the command with `SandboxUnavailableError`.
+  Agents either retry, `await ensureWorkspaceGrant(root)`, or rely on a
+  `prewarm`ed workspace that was started at boot.
+- `ready` — the standing ACE is confirmed; every later provision hits the
+  exact-ACE skip and is O(1).
+- `failed` — `maxGrantRetries` consecutive grant failures (default 3) pin the
+  workspace here: automatic retries stop and commands stay refused until an
+  operator or agent calls `retryWorkspaceGrant(root)`.
 
 ## Measured impact
 

@@ -18,10 +18,13 @@ provision never freezes the event loop.
 - Non-blocking workspace authorization: the standing write ACE is materialized
   by a `grant-cli` child process (fire-and-forget), never on the event loop.
 - Concurrent first-time grants for one workspace coalesce onto a single
-  `grant-cli` spawn.
-- Fail-closed semantics: until the standing ACE lands, confined workspace
-  writes are denied; once it stands, the exact-ACE skip makes later provisions
-  O(1).
+  `grant-cli` spawn; workspace roots are canonicalized
+  (`realpathSync.native`) so every spelling of one directory shares one
+  in-flight grant, one SID, and one failure counter.
+- Fail-closed, no early child starts: a workspace-write command is not started
+  until its grant is confirmed — while it is `preparing` or `failed`,
+  `confine()` refuses with `SandboxUnavailableError`; once it stands, the
+  exact-ACE skip makes later provisions O(1).
 - Standing / revocable lifecycle: the workspace ACE is the cross-session reuse
   cache (never revoked); each session/workspace pair gets a random private temp
   directory with its own capability SID, revoked on provider dispose.
