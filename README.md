@@ -85,6 +85,46 @@ PRs. This package ships the same fix as an independent, installable plugin so
 any official-harness user gets the non-blocking behavior without maintaining a
 fork.
 
+## Third-party notices
+
+This package builds on, and in no way modifies, the following upstream projects
+(their licenses apply to the linked sources, not to this package's own code):
+
+- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (MIT) —
+  `SandboxProvider` base class and the `dsh` plugin/bundle runtime this plugin
+  plugs into (`@deepseek-ai/dsh-sandbox`, `@deepseek-ai/dsh-sandbox-windows-acl`,
+  `@deepseek-ai/dsh-sandbox-local`).
+- [Cordis](https://github.com/cordiverse/cordis) (MIT) — the plugin/bundle
+  container (`ctx`, `plugin`, bundle-patch layers).
+- [koffi](https://github.com/Koromix/rygel) (MIT) — the FFI layer used by the
+  upstream windows-acl backend for `SetNamedSecurityInfoW`; not a direct
+  dependency here but transitively exercised by the ACL primitives we reuse.
+- [Win32 API `SetNamedSecurityInfoW`](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-setnamedsecurityinfow)
+  — Microsoft docs reference for the inherited-ACE propagation semantics this
+  fix avoids.
+
+All reuse is via the official packages' published public APIs and type
+declarations; no upstream source is vendored or copied into this repository.
+
+## Contributing
+
+Contributions are welcome but should stay within the package's narrow scope:
+non-blocking Windows ACL sandboxing for DeepSeek Harness. Before opening a PR,
+please:
+
+1. Keep every change on a real code path — no empty skeletons, no
+   `not-implemented` stubs, no hardcoded values.
+2. Preserve the fail-closed invariant: a missing standing ACE must deny, never
+   freeze, and never silently widen the grant.
+3. Add or update tests: unit tests (`vitest run`) and, for ACL semantics, the
+   real end-to-end script (`scripts/e2e-acl.ts`, Win32-only, asserts via
+   `icacls`).
+4. Verify with `pnpm --filter @topolyte/windows-acl exec vitest run` before
+   submitting.
+
+Report bugs and upstream concerns via GitHub issues rather than forks; this
+package deliberately avoids forking the official harness.
+
 ## License
 
 MIT
