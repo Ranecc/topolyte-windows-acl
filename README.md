@@ -12,7 +12,11 @@ HTTP, RPC) on first use. This package fixes that — the tree walk runs in a
 freezes a command spawn.
 
 Installs on the **official** harness as a `ctx.sandbox` replacement via the
-Cordis bundle-patch mechanism — **no fork required**.
+Cordis bundle-patch mechanism — **no fork required**. The provider is
+Windows-only by construction; on Linux/macOS the bundle patch leaves the
+official platform-neutral sandbox chain (bwrap/landlock/seatbelt) untouched and
+this provider's row is inserted disabled — install is a safe no-op there, so
+the same one-liner works on every platform.
 
 ## What it does
 
@@ -83,9 +87,11 @@ dsh plugin --profile <name> add /path/to/@topolyte/windows-acl
 ```
 
 The bundle's `cordis.patch.yml` disables the official `@deepseek-ai/dsh-sandbox-local`
-row and inserts this provider under its own id (`topolyte-sandbox`), so it
-becomes the only live `ctx.sandbox` service. Configure the workspaces to
-pre-warm at boot:
+row and inserts this provider under its own id (`topolyte-sandbox`) — both
+actions gated on `process.platform === 'win32'` — so on Windows it becomes the
+only live `ctx.sandbox` service, while on Linux/macOS the official row stays
+live and this row is inserted disabled (never selected as `ctx.sandbox`).
+Configure the workspaces to pre-warm at boot:
 
 ```yaml
 - insert:
