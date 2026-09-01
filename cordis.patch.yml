@@ -13,27 +13,33 @@
 # reconciles it into `dsh.profile.bundles` automatically and it joins the
 # profile layer stack on every boot.
 #
-# Two actions, in order:
-#  1. DISABLE the official `@deepseek-ai/dsh-sandbox-local` row. The `name`
-#     guard makes the patch fail loudly (warn + skip) if the base bundle ever
-#     renames that row, instead of silently disabling some other `sandbox`.
-#     The base row's platform runner chain (bwrap/landlock/seatbelt/windows-acl)
-#     is irrelevant on a Topolyte install: our provider is Windows-only by
-#     construction and this plugin IS the Windows sandbox.
-#  2. INSERT our provider under its own row id. A distinct id avoids duplicate
-#     `sandbox` ids in the merged entry list — the disabled official row keeps
-#     its id, our provider owns `topolyte-sandbox` and is the ONLY live
-#     `ctx.sandbox` provider (cordis singleton service). `prewarm` mirrors the
-#     fork's base-bundle config: start the standing workspace grant at boot
-#     (fire-and-forget — the walk runs in the grant-cli child process, never
-#     on the event loop).
+# Two actions, in order, BOTH gated on `process.platform === 'win32'` — the
+# provider is Windows-only by construction (non-win32 `confine()` throws
+# `SandboxUnavailableError`), so on Linux/macOS the official platform-neutral
+# sandbox chain (bwrap/landlock/seatbelt) must stay live. Without this gate a
+# Topolyte install would disable a working sandbox chain and replace it with a
+# provider that refuses every command.
+#  1. DISABLE the official `@deepseek-ai/dsh-sandbox-local` row (win32 only).
+#     The `name` guard makes the patch fail loudly (warn + skip) if the base
+#     bundle ever renames that row, instead of silently disabling some other
+#     `sandbox`. On non-win32 this evaluates to `false` and leaves the official
+#     row untouched.
+#  2. INSERT our provider under its own row id (win32 only — disabled on other
+#     platforms so the row exists but never serves `ctx.sandbox`). A distinct
+#     id avoids duplicate `sandbox` ids in the merged entry list — the disabled
+#     official row keeps its id, our provider owns `topolyte-sandbox` and is
+#     the ONLY live `ctx.sandbox` provider on win32 (cordis singleton service).
+#     `prewarm` mirrors the fork's base-bundle config: start the standing
+#     workspace grant at boot (fire-and-forget — the walk runs in the grant-cli
+#     child process, never on the event loop).
 - id: sandbox
   name: '@deepseek-ai/dsh-sandbox-local'
-  disabled: true
+  disabled: !!js process.platform === 'win32'
 
 - insert:
     - id: topolyte-sandbox
       name: '@topolyte/windows-acl'
+      disabled: !!js process.platform !== 'win32'
       config:
         prewarm:
           - !!js process.cwd()
