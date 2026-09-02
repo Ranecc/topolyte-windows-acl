@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-02
+
+### Fixed
+
+- `cordis.patch.yml` now gates both actions on `process.platform === 'win32'`:
+  on Linux/macOS the official `@deepseek-ai/dsh-sandbox-local` row stays
+  enabled and the ACL provider row is disabled, so installing this plugin no
+  longer replaces a working platform-neutral sandbox chain (bwrap/landlock/
+  seatbelt) with a Windows-only provider (ac20fbd).
+
 ## [0.2.0] - 2026-08-20
 
 Follow-up hardening of the confinement state machine, aligned with the
